@@ -2390,6 +2390,13 @@ pub enum CommitError {
         /// Target field.
         field: FieldPath,
     },
+    /// A write would leave a document past Firestore's 1 MiB ceiling.
+    DocumentTooLarge {
+        /// Target document.
+        key: DocumentKey,
+        /// Its size as Firestore reckons it.
+        size: u64,
+    },
     /// The internal revision counter cannot advance further.
     RevisionExhausted,
     /// A durable backend could not safely accept or acknowledge the commit.
@@ -2418,6 +2425,11 @@ impl Display for CommitError {
                 formatter,
                 "numeric transform for {key} field {:?} requires a numeric operand",
                 field.segments()
+            ),
+            // The official emulator's words, whatever the document's size.
+            Self::DocumentTooLarge { .. } => write!(
+                formatter,
+                "maximum entity size is {MAX_DOCUMENT_BYTES} bytes"
             ),
             Self::RevisionExhausted => formatter.write_str("store revision exhausted"),
             Self::PersistenceUnavailable(error) => {
@@ -3005,6 +3017,76 @@ fn value_logical_bytes(value: &Value) -> u64 {
     }
 }
 
+/// The largest document Firestore writes, in bytes as it reckons them.
+pub const MAX_DOCUMENT_BYTES: u64 = 1_048_576;
+
+/// A document's size as Firestore documents its reckoning
+/// (<https://firebase.google.com/docs/firestore/storage-size>): its name,
+/// each field's name and value, and 32 bytes more. Production refuses a
+/// write that leaves a document past [`MAX_DOCUMENT_BYTES`].
+#[must_use]
+pub fn document_storage_bytes(key: &DocumentKey, fields: &Fields) -> u64 {
+    name_storage_bytes(&key.path)
+        .saturating_add(map_storage_bytes(fields))
+        .saturating_add(32)
+}
+
+fn string_storage_bytes(value: &str) -> u64 {
+    usize_to_u64(value.len()).saturating_add(1)
+}
+
+/// A document name: each collection and document id as a string, and 16
+/// bytes more.
+fn name_storage_bytes(path: &str) -> u64 {
+    path.split('/').fold(16_u64, |total, id| {
+        total.saturating_add(string_storage_bytes(id))
+    })
+}
+
+fn map_storage_bytes(fields: &BTreeMap<String, Value>) -> u64 {
+    fields.iter().fold(0_u64, |total, (name, value)| {
+        total
+            .saturating_add(string_storage_bytes(name))
+            .saturating_add(value_storage_bytes(value))
+    })
+}
+
+fn value_storage_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Null | Value::Boolean(_) => 1,
+        Value::Integer(_) | Value::Double(_) | Value::Timestamp(_) => 8,
+        Value::String(value) => string_storage_bytes(value),
+        Value::Bytes(value) => usize_to_u64(value.len()),
+        Value::Reference(name) => name_storage_bytes(
+            name.split_once("/documents/")
+                .map_or(name.as_ref(), |(_, path)| path),
+        ),
+        Value::GeoPoint { .. } => 16,
+        Value::Array(values) => values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(value_storage_bytes(value))
+        }),
+        Value::Map(values) => map_storage_bytes(values),
+        // A vector is stored as a map: `__type__: "__vector__"` and its
+        // doubles under `value`.
+        Value::Vector(values) => string_storage_bytes("__type__")
+            .saturating_add(string_storage_bytes("__vector__"))
+            .saturating_add(string_storage_bytes("value"))
+            .saturating_add(usize_to_u64(values.len()).saturating_mul(8)),
+    }
+}
+
+/// Refuses a document a write would leave past Firestore's ceiling.
+fn check_document_size(key: &DocumentKey, fields: &Fields) -> Result<(), CommitError> {
+    let size = document_storage_bytes(key, fields);
+    if size > MAX_DOCUMENT_BYTES {
+        return Err(CommitError::DocumentTooLarge {
+            key: key.clone(),
+            size,
+        });
+    }
+    Ok(())
+}
+
 fn document_entry_logical_bytes(key: &DocumentKey, document: &Document) -> u64 {
     document_key_logical_bytes(key).saturating_add(document_logical_bytes(document))
 }
@@ -3057,6 +3139,7 @@ fn apply_write(
             if documents.contains_key(key) {
                 return Err(CommitError::AlreadyExists(key.clone()));
             }
+            check_document_size(key, fields)?;
             Ok((
                 key.clone(),
                 Some(Arc::new(Document {
@@ -3083,6 +3166,7 @@ fn apply_write(
             {
                 return Ok((key.clone(), previous.cloned()));
             }
+            check_document_size(key, &next_fields)?;
             Ok((
                 key.clone(),
                 Some(Arc::new(Document {
@@ -3113,6 +3197,7 @@ fn apply_write(
             for transform in transforms {
                 apply_transform(&mut next_fields, transform, commit_time, key)?;
             }
+            check_document_size(key, &next_fields)?;
 
             Ok((
                 key.clone(),
@@ -5221,6 +5306,95 @@ mod tests {
         );
         assert_eq!(store.revision(), revision);
         assert!(store.snapshot().get(&other).is_none());
+    }
+
+    #[test]
+    fn document_size_follows_the_documented_reckoning() {
+        // The worked example of
+        // https://firebase.google.com/docs/firestore/storage-size: 44
+        // bytes of name, 71 of fields, 32 more.
+        let task = key(&database("(default)"), "users/jeff/tasks/my_task_id");
+        let task_fields = Fields::from([
+            ("type".to_owned(), Value::String("Personal".into())),
+            ("done".to_owned(), Value::Boolean(false)),
+            ("priority".to_owned(), Value::Integer(1)),
+            (
+                "description".to_owned(),
+                Value::String("Learn Cloud Firestore".into()),
+            ),
+        ]);
+        assert_eq!(document_storage_bytes(&task, &task_fields), 147);
+    }
+
+    #[test]
+    fn a_write_past_one_mebibyte_is_refused_and_leaves_the_document() {
+        // The official emulator answers `INVALID_ARGUMENT: maximum entity
+        // size is 1048576 bytes` to each of these, and production refuses
+        // them too.
+        let store = Store::default();
+        let database = database("(default)");
+        let grown = key(&database, "things/grown");
+        let chunk = Value::String("x".repeat(400 << 10).into());
+        let two = Fields::from([
+            ("one".to_owned(), chunk.clone()),
+            ("two".to_owned(), chunk.clone()),
+        ]);
+        let three = Fields::from([
+            ("a".to_owned(), chunk.clone()),
+            ("b".to_owned(), chunk.clone()),
+            ("c".to_owned(), chunk.clone()),
+        ]);
+        store
+            .commit(&[Write::Set {
+                key: grown.clone(),
+                fields: two,
+                transforms: Vec::new(),
+                precondition: Precondition::None,
+            }])
+            .expect("two 400 KiB fields fit");
+        let revision = store.revision();
+
+        let refused = [
+            Write::Patch {
+                key: grown.clone(),
+                fields: Fields::from([("three".to_owned(), chunk.clone())]),
+                update_mask: vec![path(&["three"])],
+                transforms: Vec::new(),
+                precondition: Precondition::Exists(true),
+            },
+            Write::Set {
+                key: key(&database, "things/set"),
+                fields: three.clone(),
+                transforms: Vec::new(),
+                precondition: Precondition::None,
+            },
+            Write::Create {
+                key: key(&database, "things/created"),
+                fields: three,
+            },
+        ];
+        for write in refused {
+            let error = store
+                .commit(std::slice::from_ref(&write))
+                .expect_err("a document past 1 MiB is refused");
+            assert!(
+                matches!(error, CommitError::DocumentTooLarge { size, .. } if size > MAX_DOCUMENT_BYTES),
+                "{error:?}"
+            );
+            assert_eq!(error.to_string(), "maximum entity size is 1048576 bytes");
+        }
+        assert_eq!(store.revision(), revision);
+        let kept = store
+            .snapshot()
+            .get(&grown)
+            .expect("the grown document stays");
+        assert!(kept.fields().get("three").is_none());
+        assert!(
+            store
+                .snapshot()
+                .get(&key(&database, "things/set"))
+                .is_none()
+        );
     }
 
     #[test]

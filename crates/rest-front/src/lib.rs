@@ -2530,7 +2530,8 @@ impl RestError {
                 "FAILED_PRECONDITION",
                 format!("update time precondition failed: {key}"),
             ),
-            CommitError::InvalidNumericTransformOperand { .. } => (
+            CommitError::InvalidNumericTransformOperand { .. }
+            | CommitError::DocumentTooLarge { .. } => (
                 StatusCode::BAD_REQUEST,
                 "INVALID_ARGUMENT",
                 error.to_string(),

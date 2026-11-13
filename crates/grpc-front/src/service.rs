@@ -2169,9 +2169,8 @@ fn commit_status(error: CommitError) -> Status {
         CommitError::UpdateTimePrecondition { key, .. } => {
             Status::failed_precondition(format!("update time precondition failed: {key}"))
         }
-        CommitError::InvalidNumericTransformOperand { .. } => {
-            Status::invalid_argument(error.to_string())
-        }
+        CommitError::InvalidNumericTransformOperand { .. }
+        | CommitError::DocumentTooLarge { .. } => Status::invalid_argument(error.to_string()),
         CommitError::RevisionExhausted => Status::resource_exhausted(error.to_string()),
         CommitError::PersistenceUnavailable(_) => Status::unavailable(error.to_string()),
     }
