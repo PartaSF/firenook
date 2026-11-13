@@ -714,6 +714,9 @@ fn routes(state: StorageState) -> Router {
         .route("/internal/export", post(internal_export))
         .route("/internal/reset", post(internal_reset))
         .route("/internal/setRules", put(internal_set_rules))
+        // The XML API's object read (`GET /{bucket}/{object}`), which the Go
+        // client sends for every download, as the official emulator serves it.
+        .route("/{bucket}/{*object}", get(gcs_download))
         .fallback(not_found)
         .layer(middleware::from_fn(cors))
         .with_state(state)
@@ -4201,6 +4204,87 @@ mod tests {
             ))
             .await
             .expect("Admin GCS upload");
+        assert_eq!(response.status(), StatusCode::OK);
+        runtime.shutdown().await.expect("shutdown");
+        std::fs::remove_dir_all(root).expect("remove test storage");
+    }
+
+    #[tokio::test]
+    async fn the_xml_api_reads_an_object_as_the_official_emulator_does() {
+        // The Go client reads every object with `GET /{bucket}/{object}`.
+        // The official emulator (firebase-tools 15.22.0) answers it as its
+        // `/download/storage/v1` read: 200 with the bytes, 206 with
+        // `Content-Range` for a range, 404 for a missing object.
+        let (runtime, _dispatches, root) = runtime("xml-read", None).await;
+        let response = runtime
+            .application()
+            .oneshot(request(
+                Method::POST,
+                &format!(
+                    "/upload/storage/v1/b/{DEFAULT_BUCKET}/o?uploadType=media&name=a%2Fb%2Fc.txt"
+                ),
+                Body::from("hello world"),
+            ))
+            .await
+            .expect("upload");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = runtime
+            .application()
+            .oneshot(request(
+                Method::GET,
+                &format!("/{DEFAULT_BUCKET}/a/b/c.txt"),
+                Body::empty(),
+            ))
+            .await
+            .expect("XML read");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("x-goog-generation"));
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("XML read body"),
+            "hello world"
+        );
+
+        let response = runtime
+            .application()
+            .oneshot(
+                Request::get(format!("/{DEFAULT_BUCKET}/a/b/c.txt"))
+                    .header(header::RANGE, "bytes=0-4")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("XML range read");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE),
+            Some(&HeaderValue::from_static("bytes 0-4/11"))
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("XML range body"),
+            "hello"
+        );
+
+        let response = runtime
+            .application()
+            .oneshot(request(
+                Method::GET,
+                &format!("/{DEFAULT_BUCKET}/a/b/missing.txt"),
+                Body::empty(),
+            ))
+            .await
+            .expect("XML read of a missing object");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = runtime
+            .application()
+            .oneshot(request(Method::GET, "/b", Body::empty()))
+            .await
+            .expect("bucket inventory");
         assert_eq!(response.status(), StatusCode::OK);
         runtime.shutdown().await.expect("shutdown");
         std::fs::remove_dir_all(root).expect("remove test storage");
